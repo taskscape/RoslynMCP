@@ -1056,6 +1056,54 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
         Assert.All(advertisedMethods, item => Assert.False(item.Attribute!.OpenWorld, item.Attribute.Name));
     }
 
+
+    [Fact]
+    [ToolCoverage("find_references")]
+    public async Task FindReferencesClassifiesDependencyInjectionRegistration()
+    {
+        var result = await analysisService.FindReferencesAsync(
+            GetProjectPath(),
+            "T:Fixture.Greeter",
+            projectName: "Fixture",
+            referenceKinds: "dependency_injection_registration",
+            includeDeclarations: false,
+            maxResults: 20,
+            CancellationToken.None);
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var references = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("references")
+            .EnumerateArray()
+            .ToArray();
+
+        Assert.Single(references);
+
+        var reference = references[0];
+
+        Assert.Contains(
+            "dependency_injection_registration",
+            reference.GetProperty("Kinds")
+                .EnumerateArray()
+                .Select(kind => kind.GetString()));
+
+        Assert.Equal(
+            "Fixture",
+            reference.GetProperty("Location").GetProperty("Project").GetString());
+
+        Assert.EndsWith(
+            "DevelopmentFeatures.cs",
+            reference.GetProperty("Location").GetProperty("File").GetString(),
+            StringComparison.OrdinalIgnoreCase);
+
+        Assert.Contains(
+            "AddSingleton",
+            reference.GetProperty("Location").GetProperty("Excerpt").GetString(),
+            StringComparison.Ordinal);
+    }
+
+
     public void Dispose()
     {
         workspaceCache.Dispose();
