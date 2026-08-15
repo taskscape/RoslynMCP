@@ -1,6 +1,6 @@
-# CSharpMCP
+# RoslynMCP
 
-CSharpMCP is a read-only Model Context Protocol server that gives coding agents compiler-accurate C# solution intelligence through Roslyn and `MSBuildWorkspace`.
+RoslynMCP (CSharpMCP) is a read-only Model Context Protocol server that gives coding agents compiler-accurate C# solution intelligence through Roslyn and `MSBuildWorkspace`.
 
 The design deliberately separates responsibilities:
 
