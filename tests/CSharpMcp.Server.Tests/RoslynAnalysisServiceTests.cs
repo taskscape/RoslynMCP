@@ -1056,7 +1056,6 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
         Assert.All(advertisedMethods, item => Assert.False(item.Attribute!.OpenWorld, item.Attribute.Name));
     }
 
-
     [Fact]
     [ToolCoverage("find_references")]
     public async Task FindReferencesClassifiesDependencyInjectionRegistration()
@@ -1078,31 +1077,249 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
             .EnumerateArray()
             .ToArray();
 
-        Assert.Single(references);
+        var reference = Assert.Single(references);
 
-        var reference = references[0];
+        var kinds = reference
+            .GetProperty("Kinds")
+            .EnumerateArray()
+            .Select(kind => kind.GetString())
+            .ToArray();
 
-        Assert.Contains(
-            "dependency_injection_registration",
-            reference.GetProperty("Kinds")
-                .EnumerateArray()
-                .Select(kind => kind.GetString()));
+        Assert.Contains("dependency_injection_registration", kinds);
+
+        var location = reference.GetProperty("Location");
 
         Assert.Equal(
             "Fixture",
-            reference.GetProperty("Location").GetProperty("Project").GetString());
+            location.GetProperty("Project").GetString());
 
-        Assert.EndsWith(
+        Assert.Equal(
             "DevelopmentFeatures.cs",
-            reference.GetProperty("Location").GetProperty("File").GetString(),
-            StringComparison.OrdinalIgnoreCase);
+            Path.GetFileName(location.GetProperty("File").GetString()));
 
         Assert.Contains(
             "AddSingleton",
-            reference.GetProperty("Location").GetProperty("Excerpt").GetString(),
+            location.GetProperty("Excerpt").GetString(),
+            StringComparison.Ordinal);
+    }
+    [Fact]
+    [ToolCoverage("find_references")]
+    public async Task FindReferencesClassifiesEventSubscriptionAndUnsubscription()
+    {
+        var result = await analysisService.FindReferencesAsync(
+            GetProjectPath(),
+            "E:Fixture.EventPublisher.Changed",
+            projectName: "Fixture",
+            referenceKinds: "event_subscribe,event_unsubscribe",
+            includeDeclarations: false,
+            maxResults: 20,
+            CancellationToken.None);
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var references = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("references")
+            .EnumerateArray()
+            .ToArray();
+
+        Assert.Equal(2, references.Length);
+
+        var kinds = references
+            .SelectMany(reference => reference
+                .GetProperty("Kinds")
+                .EnumerateArray()
+                .Select(kind => kind.GetString()))
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Contains("event_subscribe", kinds);
+        Assert.Contains("event_unsubscribe", kinds);
+
+        Assert.All(
+            references,
+            reference =>
+            {
+                var location = reference.GetProperty("Location");
+
+                Assert.Equal(
+                    "Fixture",
+                    location.GetProperty("Project").GetString());
+
+                Assert.EndsWith(
+                    "DevelopmentFeatures.cs",
+                    location.GetProperty("File").GetString(),
+                    StringComparison.OrdinalIgnoreCase);
+            });
+    }
+
+    [Fact]
+    [ToolCoverage("find_references")]
+    public async Task FindReferencesClassifiesTestProjectReference()
+    {
+        var result = await analysisService.FindReferencesAsync(
+            GetSolutionPath(),
+            "M:Fixture.CandidateMethods.TestOnly",
+            projectName: "Fixture",
+            referenceKinds: "test_reference",
+            includeDeclarations: false,
+            maxResults: 20,
+            CancellationToken.None);
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var references = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("references")
+            .EnumerateArray()
+            .ToArray();
+
+        var reference = Assert.Single(references);
+
+        var kinds = reference
+            .GetProperty("Kinds")
+            .EnumerateArray()
+            .Select(kind => kind.GetString())
+            .ToArray();
+
+        var location = reference.GetProperty("Location");
+
+        Assert.Contains("test_reference", kinds);
+        Assert.Contains("invocation", kinds);
+
+        Assert.Equal("Fixture.Tests", location.GetProperty("Project").GetString());
+        Assert.Equal("TestUsages.cs", Path.GetFileName(location.GetProperty("File").GetString()));
+        Assert.Contains("TestOnly()", location.GetProperty("Excerpt").GetString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [ToolCoverage("find_references")]
+    public async Task FindReferencesCanReturnSymbolDeclaration()
+    {
+        var result = await analysisService.FindReferencesAsync(
+            GetProjectPath(),
+            "M:Fixture.IGreeter.Greet(System.String)",
+            projectName: "Fixture",
+            referenceKinds: "declaration",
+            includeDeclarations: true,
+            maxResults: 20,
+            CancellationToken.None);
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var references = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("references")
+            .EnumerateArray()
+            .ToArray();
+
+        var reference = Assert.Single(
+            references,
+            item => item.GetProperty("Role").GetString() == "declaration");
+
+        var kinds = reference
+            .GetProperty("Kinds")
+            .EnumerateArray()
+            .Select(kind => kind.GetString())
+            .ToArray();
+
+        Assert.Contains("declaration", kinds);
+
+        var location = reference.GetProperty("Location");
+
+        Assert.Equal(
+            "Fixture",
+            location.GetProperty("Project").GetString());
+
+        Assert.Equal(
+            "Services.cs",
+            Path.GetFileName(location.GetProperty("File").GetString()));
+
+        Assert.Contains(
+            "Greet(string name)",
+            location.GetProperty("Excerpt").GetString(),
             StringComparison.Ordinal);
     }
 
+
+    [Fact]
+    [ToolCoverage("type_usage")]
+    public async Task TypeUsageClassifiesDependencyInjectionRegistration()
+    {
+        var result = await analysisService.GetTypeUsageAsync(
+            GetProjectPath(),
+            "T:Fixture.IGreeter",
+            projectName: "Fixture",
+            maxResults: 20,
+            CancellationToken.None);
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var usages = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("usages")
+            .EnumerateArray()
+            .ToArray();
+
+        Assert.Contains(
+            usages,
+            usage => usage.GetProperty("Role").GetString() == "di-registration-candidate");
+
+        Assert.Contains(
+            usages,
+            usage => usage.GetProperty("Role").GetString() == "api-signature");
+
+        var summary = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("summary");
+
+        Assert.True(summary.GetProperty("di-registration-candidate").GetInt32() >= 1);
+    }
+
+    [Fact]
+    [ToolCoverage("symbol_source")]
+    public async Task SymbolSourceReportsAmbiguousSymbolQuery()
+    {
+        var result = await analysisService.GetSymbolSourceAsync(
+            GetProjectPath(),
+            ["Echo"],
+            projectName: "Fixture",
+            includeBody: true,
+            maxLines: 50,
+            maxCharacters: 5000,
+            CancellationToken.None);
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var item = Assert.Single(
+            document.RootElement
+                .GetProperty("Data")
+                .GetProperty("items")
+                .EnumerateArray());
+
+        Assert.Equal(
+            "ambiguous",
+            item.GetProperty("status").GetString());
+
+        var candidates = item
+            .GetProperty("candidates")
+            .EnumerateArray()
+            .Select(candidate => candidate.GetString())
+            .ToArray();
+
+        Assert.Equal(2, candidates.Length);
+
+        Assert.Contains(
+            "M:Fixture.Overloads.Echo(System.String)",
+            candidates);
+
+        Assert.Contains(
+            "M:Fixture.Overloads.Echo(System.Int32)",
+            candidates);
+
+        Assert.DoesNotContain(
+            "declarations",
+            item.EnumerateObject().Select(property => property.Name));
+    }
 
     public void Dispose()
     {
