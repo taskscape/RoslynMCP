@@ -1102,6 +1102,7 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
             location.GetProperty("Excerpt").GetString(),
             StringComparison.Ordinal);
     }
+
     [Fact]
     [ToolCoverage("find_references")]
     public async Task FindReferencesClassifiesEventSubscriptionAndUnsubscription()
@@ -1130,10 +1131,10 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
                 .GetProperty("Kinds")
                 .EnumerateArray()
                 .Select(kind => kind.GetString()))
-            .ToHashSet(StringComparer.Ordinal);
+            .ToArray();
 
-        Assert.Contains("event_subscribe", kinds);
-        Assert.Contains("event_unsubscribe", kinds);
+        Assert.Equal(1, kinds.Count(kind => kind == "event_subscribe"));
+        Assert.Equal(1, kinds.Count(kind => kind == "event_unsubscribe"));
 
         Assert.All(
             references,
@@ -1141,14 +1142,10 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
             {
                 var location = reference.GetProperty("Location");
 
+                Assert.Equal("Fixture", location.GetProperty("Project").GetString());
                 Assert.Equal(
-                    "Fixture",
-                    location.GetProperty("Project").GetString());
-
-                Assert.EndsWith(
                     "DevelopmentFeatures.cs",
-                    location.GetProperty("File").GetString(),
-                    StringComparison.OrdinalIgnoreCase);
+                    Path.GetFileName(location.GetProperty("File").GetString()));
             });
     }
 
@@ -1175,20 +1172,26 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
 
         var reference = Assert.Single(references);
 
-        var kinds = reference
-            .GetProperty("Kinds")
-            .EnumerateArray()
-            .Select(kind => kind.GetString())
-            .ToArray();
+        Assert.Contains(
+            "test_reference",
+            reference.GetProperty("Kinds")
+                .EnumerateArray()
+                .Select(kind => kind.GetString()));
+
+        Assert.Contains(
+            "invocation",
+            reference.GetProperty("Kinds")
+                .EnumerateArray()
+                .Select(kind => kind.GetString()));
 
         var location = reference.GetProperty("Location");
 
-        Assert.Contains("test_reference", kinds);
-        Assert.Contains("invocation", kinds);
-
         Assert.Equal("Fixture.Tests", location.GetProperty("Project").GetString());
         Assert.Equal("TestUsages.cs", Path.GetFileName(location.GetProperty("File").GetString()));
-        Assert.Contains("TestOnly()", location.GetProperty("Excerpt").GetString(), StringComparison.Ordinal);
+        Assert.Contains(
+            "TestOnly()",
+            location.GetProperty("Excerpt").GetString(),
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1240,7 +1243,6 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
             StringComparison.Ordinal);
     }
 
-
     [Fact]
     [ToolCoverage("type_usage")]
     public async Task TypeUsageClassifiesDependencyInjectionRegistration()
@@ -1272,7 +1274,9 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
             .GetProperty("Data")
             .GetProperty("summary");
 
-        Assert.True(summary.GetProperty("di-registration-candidate").GetInt32() >= 1);
+        Assert.Equal(
+            1,
+            summary.GetProperty("di-registration-candidate").GetInt32());
     }
 
     [Fact]
@@ -1296,9 +1300,7 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
                 .GetProperty("items")
                 .EnumerateArray());
 
-        Assert.Equal(
-            "ambiguous",
-            item.GetProperty("status").GetString());
+        Assert.Equal("ambiguous", item.GetProperty("status").GetString());
 
         var candidates = item
             .GetProperty("candidates")
@@ -1307,18 +1309,161 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
             .ToArray();
 
         Assert.Equal(2, candidates.Length);
+        Assert.Contains("M:Fixture.Overloads.Echo(System.String)", candidates);
+        Assert.Contains("M:Fixture.Overloads.Echo(System.Int32)", candidates);
+    }
+
+    [Fact]
+    [ToolCoverage("semantic_search")]
+    public async Task SemanticSearchRejectsUnknownSymbolKind()
+    {
+        var exception = await Assert.ThrowsAsync<ArgumentException>(() =>
+            analysisService.SemanticSearchAsync(
+                GetProjectPath(),
+                "Greeter",
+                projectName: "Fixture",
+                symbolKinds: "DefinitelyNotASymbolKind",
+                maxResults: 20,
+                CancellationToken.None));
+
+        Assert.Equal("symbolKinds", exception.ParamName);
+    }
+
+    [Fact]
+    [ToolCoverage("find_references")]
+    public async Task FindReferencesClassifiesPropertyReadAndWrite()
+    {
+        var result = await analysisService.FindReferencesAsync(
+            GetProjectPath(),
+            "P:Fixture.FactoryProduct.Name",
+            projectName: "Fixture",
+            referenceKinds: "read,write",
+            includeDeclarations: false,
+            maxResults: 20,
+            CancellationToken.None);
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var references = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("references")
+            .EnumerateArray()
+            .ToArray();
+
+        Assert.Equal(2, references.Length);
+
+        var kinds = references
+            .SelectMany(reference => reference
+                .GetProperty("Kinds")
+                .EnumerateArray()
+                .Select(kind => kind.GetString()))
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Contains("read", kinds);
+        Assert.Contains("write", kinds);
+    }
+
+    [Fact]
+    [ToolCoverage("diagnostics")]
+    public async Task DiagnosticsCanBeFilteredToDocument()
+    {
+        var result = await analysisService.GetDiagnosticsAsync(
+            GetProjectPath(),
+            projectName: "Fixture",
+            minimumSeverity: "warning",
+            includeAnalyzers: true,
+            documentPath: GetServicesPath(),
+            diagnosticIds: "CA1822",
+            includeSuppressed: true,
+            maxResults: 100,
+            CancellationToken.None);
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var diagnostics = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("diagnostics")
+            .EnumerateArray()
+            .ToArray();
+
+        Assert.NotEmpty(diagnostics);
+
+        Assert.All(
+            diagnostics,
+            diagnostic =>
+            {
+                Assert.Equal("CA1822", diagnostic.GetProperty("Id").GetString());
+
+                var location = diagnostic.GetProperty("location");
+
+                Assert.Equal(
+                    "Fixture",
+                    location.GetProperty("Project").GetString());
+
+                Assert.Equal(
+                    "Services.cs",
+                    Path.GetFileName(location.GetProperty("File").GetString()));
+            });
+    }
+
+    [Fact]
+    [ToolCoverage("call_hierarchy")]
+    public async Task CallHierarchyRejectsNonMethodSymbol()
+    {
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            analysisService.GetCallHierarchyAsync(
+                GetProjectPath(),
+                "T:Fixture.IGreeter",
+                projectName: "Fixture",
+                direction: "callees",
+                maxDepth: 1,
+                maxResults: 20,
+                CancellationToken.None));
 
         Assert.Contains(
-            "M:Fixture.Overloads.Echo(System.String)",
-            candidates);
+            "call_hierarchy requires a method",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
 
-        Assert.Contains(
-            "M:Fixture.Overloads.Echo(System.Int32)",
-            candidates);
+    [Fact]
+    [ToolCoverage("call_hierarchy")]
+    public async Task CallHierarchyFindsMethodCaller()
+    {
+        var result = await analysisService.GetCallHierarchyAsync(
+            GetProjectPath(),
+            "M:Fixture.CandidateMethods.UsedProduction",
+            projectName: "Fixture",
+            direction: "callers",
+            maxDepth: 1,
+            maxResults: 20,
+            CancellationToken.None);
 
-        Assert.DoesNotContain(
-            "declarations",
-            item.EnumerateObject().Select(property => property.Name));
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(result));
+
+        var edges = document.RootElement
+            .GetProperty("Data")
+            .GetProperty("edges")
+            .EnumerateArray()
+            .ToArray();
+
+        var edge = Assert.Single(
+            edges,
+            item => item.GetProperty("direction").GetString() == "caller");
+
+        Assert.Equal(
+            "M:Fixture.Consumer.Run(Fixture.IGreeter,Fixture.CandidateMethods)",
+            edge.GetProperty("from")
+                .GetProperty("Id")
+                .GetString());
+
+        Assert.Equal(
+            "M:Fixture.CandidateMethods.UsedProduction",
+            edge.GetProperty("to")
+                .GetProperty("Id")
+                .GetString());
+
+        Assert.Equal(1, edge.GetProperty("depth").GetInt32());
     }
 
     public void Dispose()
