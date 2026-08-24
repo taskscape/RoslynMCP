@@ -34,6 +34,16 @@ $publishDirectory = Join-Path $installerRoot 'artifacts\server'
 $outputDirectory = Join-Path $installerRoot 'output'
 $installerDefinition = Join-Path $installerRoot 'CSharpMCP.iss'
 $versionFile = Join-Path $repositoryRoot 'VERSION'
+$globalJsonPath = Join-Path $repositoryRoot 'global.json'
+
+$globalJson = Get-Content -LiteralPath $globalJsonPath -Raw | ConvertFrom-Json
+$dotNetSdkVersion = [string] $globalJson.sdk.version
+$dotNetSdkRollForward = [string] $globalJson.sdk.rollForward
+$dotNetSdkAllowPrerelease = if ([bool] $globalJson.sdk.allowPrerelease) { 'true' } else { 'false' }
+if ([string]::IsNullOrWhiteSpace($dotNetSdkVersion) -or [string]::IsNullOrWhiteSpace($dotNetSdkRollForward))
+{
+    throw "global.json must specify sdk.version and sdk.rollForward before building the installer."
+}
 
 if ([string]::IsNullOrWhiteSpace($Version))
 {
@@ -191,6 +201,9 @@ $compilerArguments = @(
     "/DVersionInfoVersion=$versionInfoVersion",
     '/DInstallerArchitecture=x64compatible',
     "/DOutputBaseFilename=$outputBaseFilename",
+    "/DDotNetSdkVersion=$dotNetSdkVersion",
+    "/DDotNetSdkRollForward=$dotNetSdkRollForward",
+    "/DDotNetSdkAllowPrerelease=$dotNetSdkAllowPrerelease",
     $installerDefinition
 )
 

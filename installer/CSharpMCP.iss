@@ -37,6 +37,14 @@
   #define DotNetSdkVersion "10.0.302"
 #endif
 
+#ifndef DotNetSdkRollForward
+  #define DotNetSdkRollForward "latestPatch"
+#endif
+
+#ifndef DotNetSdkAllowPrerelease
+  #define DotNetSdkAllowPrerelease "false"
+#endif
+
 #ifndef DotNetSdkInstallerName
   #define DotNetSdkInstallerName "dotnet-sdk-10.0.302-win-x64.exe"
 #endif
@@ -137,23 +145,56 @@ Type: dirifempty; Name: "{localappdata}\CSharpMCP"
 var
   DotNetSdkDownloadPage: TDownloadWizardPage;
 
-function DotNetHostHasRequiredSdk(const DotNetPath: String): Boolean;
+function CreateDotNetSdkSelectionDirectory(var SelectionDirectory: String): Boolean;
 var
-  I: Integer;
+  SelectionFile: String;
+  SelectionJson: String;
+begin
+  Result := False;
+  SelectionDirectory := AddBackslash(ExpandConstant('{tmp}')) + 'CSharpMCP-sdk-selection';
+  SelectionFile := AddBackslash(SelectionDirectory) + 'global.json';
+  SelectionJson :=
+    '{' + #13#10 +
+    '  "sdk": {' + #13#10 +
+    '    "version": "{#DotNetSdkVersion}",' + #13#10 +
+    '    "rollForward": "{#DotNetSdkRollForward}",' + #13#10 +
+    '    "allowPrerelease": {#DotNetSdkAllowPrerelease}' + #13#10 +
+    '  }' + #13#10 +
+    '}';
+
+  try
+    if not ForceDirectories(SelectionDirectory) then
+    begin
+      Log(Format('Unable to create the .NET SDK selection directory %s.', [SelectionDirectory]));
+      Exit;
+    end;
+
+    if not SaveStringToFile(SelectionFile, SelectionJson, False) then
+    begin
+      Log(Format('Unable to create the .NET SDK selection file %s.', [SelectionFile]));
+      Exit;
+    end;
+
+    Result := True;
+  except
+    Log(Format('Unable to prepare .NET SDK selection from global.json: %s', [GetExceptionMessage]));
+  end;
+end;
+
+function DotNetHostHasCompatibleSdk(const DotNetPath, SelectionDirectory: String): Boolean;
+var
   ResultCode: Integer;
   Output: TExecOutput;
-  RequiredSdkPrefix: String;
 begin
   Result := False;
   if not FileExists(DotNetPath) then
     Exit;
 
-  RequiredSdkPrefix := '{#DotNetSdkVersion} [';
   try
     if not ExecAndCaptureOutput(
       DotNetPath,
-      '--list-sdks',
-      '',
+      '--version',
+      SelectionDirectory,
       SW_SHOWNORMAL,
       ewWaitUntilTerminated,
       ResultCode,
@@ -165,19 +206,12 @@ begin
 
     if (ResultCode <> 0) or Output.Error then
     begin
-      Log(Format('The .NET SDK query through %s was incomplete (exit %d).', [DotNetPath, ResultCode]));
+      Log(Format('No .NET SDK compatible with global.json was found through %s (exit %d).', [DotNetPath, ResultCode]));
       Exit;
     end;
 
-    for I := 0 to GetArrayLength(Output.StdOut) - 1 do
-    begin
-      if Pos(RequiredSdkPrefix, Trim(Output.StdOut[I])) = 1 then
-      begin
-        Log(Format('Found required .NET SDK {#DotNetSdkVersion} through %s.', [DotNetPath]));
-        Result := True;
-        Exit;
-      end;
-    end;
+    Log(Format('Found .NET SDK compatible with global.json through %s.', [DotNetPath]));
+    Result := True;
   except
     Log(Format('Unable to inspect .NET SDKs through %s: %s', [DotNetPath, GetExceptionMessage]));
   end;
@@ -186,19 +220,24 @@ end;
 function RequiredDotNetSdkIsInstalled(): Boolean;
 var
   PathDotNet: String;
+  SelectionDirectory: String;
 begin
+  Result := False;
+  if not CreateDotNetSdkSelectionDirectory(SelectionDirectory) then
+    Exit;
+
   { Check the supported system-wide host first, then common private/PATH hosts. }
-  Result := DotNetHostHasRequiredSdk(ExpandConstant('{pf64}\dotnet\dotnet.exe'));
+  Result := DotNetHostHasCompatibleSdk(ExpandConstant('{pf64}\dotnet\dotnet.exe'), SelectionDirectory);
   if Result then
     Exit;
 
-  Result := DotNetHostHasRequiredSdk(ExpandConstant('{localappdata}\Microsoft\dotnet\dotnet.exe'));
+  Result := DotNetHostHasCompatibleSdk(ExpandConstant('{localappdata}\Microsoft\dotnet\dotnet.exe'), SelectionDirectory);
   if Result then
     Exit;
 
   PathDotNet := FileSearch('dotnet.exe', GetEnv('PATH'));
   if PathDotNet <> '' then
-    Result := DotNetHostHasRequiredSdk(PathDotNet);
+    Result := DotNetHostHasCompatibleSdk(PathDotNet, SelectionDirectory);
 end;
 
 function DownloadDotNetSdkInstaller(): String;

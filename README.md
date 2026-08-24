@@ -59,15 +59,15 @@ The generated installer is:
 C:\Projects\CSharpMCP\installer\output\CSharpMCP-2.0.0-win-x64-Setup.exe
 ```
 
-Normal CSharpMCP installation uses `%LOCALAPPDATA%\Programs\CSharpMCP`. The application payload and client configuration remain per-user. Before files are installed or either client is registered, Setup checks every common `dotnet.exe` location for the SDK version pinned by `global.json` (currently 10.0.302). If it is missing, Setup:
+Normal CSharpMCP installation uses `%LOCALAPPDATA%\Programs\CSharpMCP`. The application payload and client configuration remain per-user. Before files are installed or either client is registered, Setup checks every common `dotnet.exe` location for an SDK compatible with `global.json` (currently 10.0.302 with `latestPatch` roll-forward). If no compatible SDK is found, Setup:
 
 1. Downloads the official Microsoft x64 SDK installer from `builds.dotnet.microsoft.com` on an Inno Setup progress page.
 2. Rejects the download unless its pinned SHA-256 matches the release artifact.
 3. Requests UAC elevation only for Microsoft's system-wide SDK installer.
 4. Runs that installer as `/install /quiet /norestart`, accepting Microsoft's success code `0` and treating `3010` as a required restart.
-5. Queries `dotnet --list-sdks` again and proceeds only after the required SDK and MSBuild files are visible.
+5. Resolves `dotnet --version` against the same `global.json` policy again and proceeds only after a compatible SDK is visible.
 
-The Microsoft SDK installation itself is silent, but Windows still displays a UAC consent or credential prompt because the supported installer is system-wide. Declining UAC, losing network access, failing checksum validation, or failing post-install detection stops CSharpMCP before its registration helpers run. Machines that already have the pinned SDK do not download anything and do not request elevation.
+The Microsoft SDK installation itself is silent, but Windows still displays a UAC consent or credential prompt because the supported installer is system-wide. Declining UAC, losing network access, failing checksum validation, or failing post-install detection stops CSharpMCP before its registration helpers run. Machines that already have a `global.json`-compatible SDK do not download anything and do not request elevation.
 
 After the prerequisite gate, Setup performs these operations:
 

@@ -8,7 +8,6 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $releaseVersion = (Get-Content -LiteralPath (Join-Path $repositoryRoot 'VERSION') -Raw).Trim()
-$requiredSdkVersion = [string] ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'global.json') -Raw | ConvertFrom-Json).sdk.version)
 if ([string]::IsNullOrWhiteSpace($InstallerPath))
 {
     $InstallerPath = Join-Path $repositoryRoot "installer\output\CSharpMCP-$releaseVersion-win-x64-Setup.exe"
@@ -95,9 +94,9 @@ try
     }
 
     $setupLogContent = Get-Content -LiteralPath $setupLog -Raw
-    if ($setupLogContent.IndexOf("Found required .NET SDK $requiredSdkVersion", [StringComparison]::OrdinalIgnoreCase) -lt 0)
+    if ($setupLogContent.IndexOf('Found .NET SDK compatible with global.json', [StringComparison]::OrdinalIgnoreCase) -lt 0)
     {
-        throw 'Installer smoke setup did not prove that the SDK prerequisite was checked before installation.'
+        throw 'Installer smoke setup did not prove that a global.json-compatible SDK prerequisite was checked before installation.'
     }
 }
 finally

@@ -56,6 +56,10 @@ $requiredInstallerEvidence = @(
     'CreateDownloadPage',
     'RequiredDotNetSdkIsInstalled',
     'ExecAndCaptureOutput',
+    'CreateDotNetSdkSelectionDirectory',
+    'DotNetHostHasCompatibleSdk',
+    "'--version'",
+    'Found .NET SDK compatible with global.json',
     'DownloadDotNetSdkInstaller',
     'DotNetSdkDownloadPage.Add',
     'b2618a69a4ae385eb03bde0de89468881318c6338b14e67574d691e145a7ce1c',
@@ -75,9 +79,25 @@ foreach ($evidence in $requiredInstallerEvidence)
 
 $globalJson = Get-Content -LiteralPath (Join-Path $repositoryRoot 'global.json') -Raw | ConvertFrom-Json
 $requiredSdkVersion = [string] $globalJson.sdk.version
+$requiredSdkRollForward = [string] $globalJson.sdk.rollForward
+$requiredSdkAllowPrerelease = if ([bool] $globalJson.sdk.allowPrerelease) { 'true' } else { 'false' }
 if ($installerDefinition.IndexOf("#define DotNetSdkVersion `"$requiredSdkVersion`"", [StringComparison]::Ordinal) -lt 0)
 {
     throw "Installer prerequisite version does not match global.json SDK '$requiredSdkVersion'."
+}
+
+if ($installerDefinition.IndexOf("#define DotNetSdkRollForward `"$requiredSdkRollForward`"", [StringComparison]::Ordinal) -lt 0 -or
+    $installerDefinition.IndexOf("#define DotNetSdkAllowPrerelease `"$requiredSdkAllowPrerelease`"", [StringComparison]::OrdinalIgnoreCase) -lt 0)
+{
+    throw 'Installer SDK selection policy does not match global.json.'
+}
+
+foreach ($compilerDefine in @('DotNetSdkVersion', 'DotNetSdkRollForward', 'DotNetSdkAllowPrerelease'))
+{
+    if ($buildHelper.IndexOf("/D$compilerDefine=", [StringComparison]::Ordinal) -lt 0)
+    {
+        throw "Installer build does not pass the global.json SDK setting '$compilerDefine' to Inno Setup."
+    }
 }
 
 # Inno Setup invokes PrepareToInstall before it installs files or evaluates [Run].
