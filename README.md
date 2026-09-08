@@ -288,6 +288,78 @@ After registering the server, add durable selection and verification guidance to
 - Treat Roslyn results as compile-time facts, not proof of reflection, dynamic loading, configuration, database behavior, or distributed routing.
 ```
 
+## Connect OpenCode
+
+The Windows installer registers CSharpMCP with Codex and Claude Code, but OpenCode registration is currently manual. RoslynMCP is a local stdio server, so configure a command rather than a remote URL. Complete the build prerequisites above first, or install the self-contained Windows package.
+
+### OpenCode 1 (stable)
+
+Add the server to OpenCode's global config at `%USERPROFILE%\.config\opencode\opencode.jsonc` to use it in every repository, or merge it into `opencode.jsonc` in one repository root for project-only use. OpenCode merges configuration sources, so preserve any existing settings around the `mcp` object. The current stable format is documented in the [official OpenCode MCP guide](https://opencode.ai/docs/mcp-servers/) and [configuration guide](https://opencode.ai/docs/config/).
+
+For the normal Windows installer location, add:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "csharp_roslyn": {
+      "type": "local",
+      "command": [
+        "{env:LOCALAPPDATA}\\Programs\\CSharpMCP\\server\\CSharpMcp.Server.exe"
+      ],
+      "enabled": true,
+      "timeout": 30000
+    }
+  }
+}
+```
+
+For a source checkout, replace the `command` array with the Release DLL command:
+
+```json
+["dotnet", "C:\\Projects\\CSharpMCP\\src\\CSharpMcp.Server\\bin\\Release\\net10.0\\CSharpMcp.Server.dll"]
+```
+
+To expose the optional API compatibility and architecture tools, also add this property beside `command`, `enabled`, and `timeout`:
+
+```json
+"environment": {
+  "CSHARPMCP_TOOL_GROUPS": "all"
+}
+```
+
+### OpenCode 2 beta
+
+OpenCode 2 currently installs separately as `opencode2` and accepts the stable configuration above for compatibility. For its native V2 schema, put named servers under `mcp.servers` and omit `enabled`; servers are active unless `disabled` is `true`. See the official [V2 MCP guide](https://opencode.ai/v2/docs/mcp-servers) and [V1 migration guide](https://opencode.ai/v2/docs/migrate-v1/).
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "csharp_roslyn": {
+        "type": "local",
+        "command": [
+          "{env:LOCALAPPDATA}\\Programs\\CSharpMCP\\server\\CSharpMcp.Server.exe"
+        ]
+      }
+    }
+  }
+}
+```
+
+Use the same source-checkout `command` replacement or `environment` property shown above when needed.
+
+### Verify the OpenCode connection
+
+Restart OpenCode after editing the config, then run `opencode mcp list` (or `opencode2 mcp list` for V2) and confirm that `csharp_roslyn` is connected. OpenCode prefixes the server's tools with its configured name, so direct tools appear as `csharp_roslyn_<tool-name>`; under V2's default Code Mode they are grouped by the normalized server name. A first request can be:
+
+```text
+Use csharp_roslyn to trust C:\repo\MyApplication\MyApplication.sln for this session, then run workspace_health and solution_overview in Release configuration. Stop and report workspace-load diagnostics if the solution is incomplete.
+```
+
+If the server does not connect, verify the configured executable or DLL exists and inspect the runtime logs described above. Registration does not bypass RoslynMCP's workspace trust requirement.
+
 ## Portable Agent Skills for Codex and Claude Code
 
 Codex and Claude Code both implement the open Agent Skills directory format: a skill is a directory whose entry point is `SKILL.md` with `name` and `description` YAML frontmatter. Both clients initially load the small discovery metadata and load the body when the skill is selected, so the detailed workflow can stay out of normal context. The portable core is documented by the [Agent Skills specification](https://agentskills.io/specification), [OpenAI's Codex skills guidance](https://developers.openai.com/plugins/concepts/skills), and [Anthropic's Claude Code skills guidance](https://code.claude.com/docs/en/slash-commands).
