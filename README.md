@@ -8,7 +8,9 @@ The design deliberately separates responsibilities:
 - MCP exposes small, bounded, structured results to Codex over standard input/output.
 - Codex still edits files normally and runs the repository's authoritative builds and tests.
 
-This is preferable to embedding an entire solution or relying only on text search. It resolves overloads, namespaces, generic symbols, interface implementations, partial types, compiler diagnostics, and project references while keeping model context bounded. It does not claim to resolve runtime reflection, convention-only dependency injection, dynamically loaded assemblies, external configuration, database behavior, or distributed routing.
+Text search is fast, universal, and often the right first move. It is not a semantic impact analysis. In a large codebase, the same name can identify unrelated symbols; an interface call may dispatch to many implementations; generated code may not exist in the repository; dependency injection can hide construction; conditional compilation can change declarations; reflection and configuration can bypass static references. An agent that sees matching lines may sound confident while missing the actual program.
+
+Codex and Claude benefit from a layered code-intelligence service that returns compiler- or parser-backed facts with source locations, confidence, configuration, and freshness. The model should use those facts to reason—not pretend it derived them from raw text. This is preferable to embedding an entire solution or relying only on text search. It resolves overloads, namespaces, generic symbols, interface implementations, partial types, compiler diagnostics, and project references while keeping model context bounded. It does not claim to resolve runtime reflection, convention-only dependency injection, dynamically loaded assemblies, external configuration, database behavior, or distributed routing.
 
 ## Projects
 
