@@ -53,7 +53,17 @@ internal sealed class SolutionTrustStore
             sessionRoots.Add(root);
             if (persist && persistentRoots.Add(root))
             {
-                SavePersistentRoots();
+                try
+                {
+                    SavePersistentRoots();
+                }
+                catch (Exception exception)
+                {
+                    // A failed write must not be reported as persisted on the next attempt.
+                    persistentRoots.Remove(root);
+                    logger.LogError(exception, "Could not persist trust at {TrustStorePath}; session trust remains available", storePath);
+                    throw;
+                }
             }
 
             return new TrustEntry(root, sessionRoots.Contains(root), persistentRoots.Contains(root));
@@ -72,7 +82,21 @@ internal sealed class SolutionTrustStore
             var persistentRemoved = persistentRoots.Remove(root);
             if (persistentRemoved)
             {
-                SavePersistentRoots();
+                try
+                {
+                    SavePersistentRoots();
+                }
+                catch (Exception exception)
+                {
+                    persistentRoots.Add(root);
+                    if (sessionRemoved)
+                    {
+                        sessionRoots.Add(root);
+                    }
+
+                    logger.LogError(exception, "Could not persist trust revocation at {TrustStorePath}; revocation can be retried", storePath);
+                    throw;
+                }
             }
 
             return new TrustRevocation(root, sessionRemoved, persistentRemoved);
@@ -138,13 +162,10 @@ internal sealed class SolutionTrustStore
                 persistentRoots.Add(NormalizeRoot(root, requireExisting: false));
             }
         }
-        catch (IOException exception)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or ArgumentException or NotSupportedException)
         {
-            logger.LogWarning(exception, "Could not read the CSharpMCP trust store at {TrustStorePath}", storePath);
-        }
-        catch (JsonException exception)
-        {
-            logger.LogWarning(exception, "The CSharpMCP trust store at {TrustStorePath} is invalid JSON", storePath);
+            persistentRoots.Clear();
+            logger.LogWarning(exception, "Could not load the CSharpMCP trust store at {TrustStorePath}; no persistent trust was granted. Session trust is available", storePath);
         }
     }
 

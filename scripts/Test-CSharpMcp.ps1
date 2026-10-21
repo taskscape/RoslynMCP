@@ -38,6 +38,17 @@ try
         throw 'Installer asset validation failed.'
     }
 
+    if ($env:OS -eq 'Windows_NT' -and $PSVersionTable.PSVersion.Major -ge 6)
+    {
+        Write-Host 'Validating client registration under the Windows PowerShell host used by Setup...'
+        $setupPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        & $setupPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Test-InstallerAssets.ps1')
+        if ($LASTEXITCODE -ne 0)
+        {
+            throw "Windows PowerShell installer verification failed with exit code $LASTEXITCODE."
+        }
+    }
+
     Write-Host 'Validating versioned GitHub release automation...'
     & (Join-Path $PSScriptRoot 'Test-ReleaseWorkflow.ps1')
     if (-not $?)

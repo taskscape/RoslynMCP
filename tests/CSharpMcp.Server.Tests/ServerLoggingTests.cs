@@ -34,6 +34,19 @@ public sealed class ServerLoggingTests : IDisposable
     }
 
     [Fact]
+    public void UnavailableLogDirectoryDoesNotPreventLoggingToStderr()
+    {
+        Directory.CreateDirectory(testRoot);
+        var blockedDirectory = Path.Combine(testRoot, "blocked");
+        File.WriteAllText(blockedDirectory, "A file prevents directory creation.");
+
+        var configuration = new LoggerConfiguration();
+        ServerLogging.Configure(configuration, blockedDirectory);
+        using var logger = configuration.CreateLogger();
+        logger.Warning("Still available after a file logging failure");
+    }
+
+    [Fact]
     public void FileSinkWritesDailyLogsAndDeletesFilesOlderThanThirtyDays()
     {
         Directory.CreateDirectory(testRoot);

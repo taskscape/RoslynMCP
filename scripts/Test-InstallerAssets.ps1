@@ -191,37 +191,83 @@ try
     }
 
     $fakeLog = Join-Path $temporaryRoot 'client-arguments.log'
+    $fakeServerPath = Join-Path $temporaryRoot 'server with spaces.exe'
+    Set-Content -LiteralPath $fakeServerPath -Value 'Isolated registration fixture; never executed.'
     $fakeCodex = @'
 @echo off
 if /I "%1 %2 %3"=="mcp get csharp_roslyn" (
-  if "%FAKE_MCP_EXISTING%"=="1" exit /b 0
+  if "%FAKE_MCP_EXISTING%"=="error" goto lookup_error
+  if "%FAKE_MCP_EXISTING%"=="transient" goto transient_lookup
+  if "%FAKE_MCP_EXISTING%"=="1" (
+    echo Command: %FAKE_MCP_SERVER%
+    exit /b 0
+  )
+  if exist "%FAKE_MCP_LOG%.codex-added" (
+    echo Command: %FAKE_MCP_SERVER%
+    exit /b 0
+  )
+  echo Error: No MCP server named 'csharp_roslyn' found. 1>&2
   exit /b 1
 )
 echo CODEX %*>>"%FAKE_MCP_LOG%"
+echo added>"%FAKE_MCP_LOG%.codex-added"
+exit /b 0
+:lookup_error
+echo Temporary configuration lock 1>&2
+exit /b 2
+:transient_lookup
+if exist "%FAKE_MCP_LOG%.codex-retry" goto recovered
+echo retry>"%FAKE_MCP_LOG%.codex-retry"
+goto lookup_error
+:recovered
+echo Command: %FAKE_MCP_SERVER%
 exit /b 0
 '@
     $fakeClaude = @'
 @echo off
 if /I "%1 %2 %3"=="mcp get csharp_roslyn" (
-  if "%FAKE_MCP_EXISTING%"=="1" exit /b 0
+  if "%FAKE_MCP_EXISTING%"=="error" goto lookup_error
+  if "%FAKE_MCP_EXISTING%"=="transient" goto transient_lookup
+  if "%FAKE_MCP_EXISTING%"=="1" (
+    echo Command: %FAKE_MCP_SERVER%
+    exit /b 0
+  )
+  if exist "%FAKE_MCP_LOG%.claude-added" (
+    echo Command: %FAKE_MCP_SERVER%
+    exit /b 0
+  )
+  echo No MCP server found with name: csharp_roslyn 1>&2
   exit /b 1
 )
 echo CLAUDE %*>>"%FAKE_MCP_LOG%"
+echo added>"%FAKE_MCP_LOG%.claude-added"
+exit /b 0
+:lookup_error
+echo Temporary configuration lock 1>&2
+exit /b 2
+:transient_lookup
+if exist "%FAKE_MCP_LOG%.claude-retry" goto recovered
+echo retry>"%FAKE_MCP_LOG%.claude-retry"
+goto lookup_error
+:recovered
+echo Command: %FAKE_MCP_SERVER%
 exit /b 0
 '@
-    Set-Content -LiteralPath (Join-Path $temporaryRoot 'codex.cmd') -Value $fakeCodex -Encoding Ascii
-    Set-Content -LiteralPath (Join-Path $temporaryRoot 'claude.cmd') -Value $fakeClaude -Encoding Ascii
+    Set-Content -LiteralPath (Join-Path $temporaryRoot 'codex.cmd') -Value ($fakeCodex -replace '\r?\n', "`r`n") -Encoding Ascii
+    Set-Content -LiteralPath (Join-Path $temporaryRoot 'claude.cmd') -Value ($fakeClaude -replace '\r?\n', "`r`n") -Encoding Ascii
 
     $previousPath = $env:PATH
     $previousFakeLog = $env:FAKE_MCP_LOG
     $previousFakeExisting = $env:FAKE_MCP_EXISTING
+    $previousFakeServer = $env:FAKE_MCP_SERVER
     try
     {
         $env:PATH = "$temporaryRoot;$previousPath"
         $env:FAKE_MCP_LOG = $fakeLog
         $env:FAKE_MCP_EXISTING = '0'
+        $env:FAKE_MCP_SERVER = $fakeServerPath
         & (Join-Path $repositoryRoot 'scripts\Register-CSharpMcpClients.ps1') `
-            -ServerPath (Join-Path $repositoryRoot 'README.md') `
+            -ServerPath $fakeServerPath `
             -Client Both `
             -ToolGroups all `
             -InstallSkills `
@@ -237,6 +283,7 @@ exit /b 0
         $env:PATH = $previousPath
         $env:FAKE_MCP_LOG = $previousFakeLog
         $env:FAKE_MCP_EXISTING = $previousFakeExisting
+        $env:FAKE_MCP_SERVER = $previousFakeServer
     }
 
     $registrationState = Get-Content -LiteralPath (Join-Path $temporaryRoot 'registration-state.json') -Raw | ConvertFrom-Json
@@ -264,8 +311,9 @@ exit /b 0
         $env:PATH = "$temporaryRoot;$previousPath"
         $env:FAKE_MCP_LOG = $fakeLog
         $env:FAKE_MCP_EXISTING = '1'
+        $env:FAKE_MCP_SERVER = $fakeServerPath
         & (Join-Path $repositoryRoot 'scripts\Register-CSharpMcpClients.ps1') `
-            -ServerPath (Join-Path $repositoryRoot 'README.md') `
+            -ServerPath $fakeServerPath `
             -Client Both `
             -StatePath (Join-Path $temporaryRoot 'existing-registration-state.json')
         if (-not $?)
@@ -278,6 +326,7 @@ exit /b 0
         $env:PATH = $previousPath
         $env:FAKE_MCP_LOG = $previousFakeLog
         $env:FAKE_MCP_EXISTING = $previousFakeExisting
+        $env:FAKE_MCP_SERVER = $previousFakeServer
     }
 
     $existingState = Get-Content -LiteralPath (Join-Path $temporaryRoot 'existing-registration-state.json') -Raw | ConvertFrom-Json
@@ -285,6 +334,62 @@ exit /b 0
     if ($existingClientRegistrations.Count -ne 2 -or @($existingClientRegistrations | Where-Object { $_.Status -ne 'already-configured' }).Count -ne 0)
     {
         throw 'The registration helper did not preserve both pre-existing client registrations.'
+    }
+
+    try
+    {
+        $env:PATH = "$temporaryRoot;$previousPath"
+        $env:FAKE_MCP_LOG = $fakeLog
+        $env:FAKE_MCP_SERVER = $fakeServerPath
+        $env:FAKE_MCP_EXISTING = '1'
+        & (Join-Path $repositoryRoot 'scripts\Register-CSharpMcpClients.ps1') -ServerPath $fakeServerPath -Client Both -StatePath (Join-Path $temporaryRoot 'registration-state.json')
+        $repeatState = Get-Content -LiteralPath (Join-Path $temporaryRoot 'registration-state.json') -Raw | ConvertFrom-Json
+        if (@($repeatState.Registrations | Where-Object { $_.InstalledByInstaller }).Count -ne 2)
+        {
+            throw 'A repeated registration lost installer ownership.'
+        }
+
+        $beforeFailure = Get-Content -LiteralPath $fakeLog -Raw
+        $env:FAKE_MCP_EXISTING = 'error'
+        $failedStatePath = Join-Path $temporaryRoot 'failed-registration-state.json'
+        & (Join-Path $repositoryRoot 'scripts\Register-CSharpMcpClients.ps1') -ServerPath $fakeServerPath -Client Both -StatePath $failedStatePath
+        $failedState = Get-Content -LiteralPath $failedStatePath -Raw | ConvertFrom-Json
+        if (@($failedState.Registrations | Where-Object Status -eq 'discovery-failed').Count -ne 2 -or
+            $failedState.Diagnostics.Count -ne 6 -or
+            (Get-Content -LiteralPath $fakeLog -Raw) -cne $beforeFailure -or
+            -not (Test-Path -LiteralPath "$failedStatePath.jsonl"))
+        {
+            throw 'Failed discovery must retry, log each failure, and avoid modifying client registrations.'
+        }
+
+        $env:FAKE_MCP_EXISTING = 'transient'
+        $recoveredStatePath = Join-Path $temporaryRoot 'recovered-registration-state.json'
+        & (Join-Path $repositoryRoot 'scripts\Register-CSharpMcpClients.ps1') -ServerPath $fakeServerPath -Client Both -StatePath $recoveredStatePath
+        $recoveredState = Get-Content -LiteralPath $recoveredStatePath -Raw | ConvertFrom-Json
+        if (@($recoveredState.Registrations | Where-Object Status -eq 'already-configured').Count -ne 2 -or
+            $recoveredState.Diagnostics.Count -ne 2 -or (Get-Content -LiteralPath $fakeLog -Raw) -cne $beforeFailure)
+        {
+            throw 'Transient discovery errors must recover without issuing duplicate add commands.'
+        }
+
+        $env:FAKE_MCP_EXISTING = '0'
+        $env:FAKE_MCP_LOG = Join-Path $temporaryRoot 'verification-arguments.log'
+        $env:FAKE_MCP_SERVER = "$fakeServerPath.extra"
+        $verificationStatePath = Join-Path $temporaryRoot 'verification-registration-state.json'
+        & (Join-Path $repositoryRoot 'scripts\Register-CSharpMcpClients.ps1') -ServerPath $fakeServerPath -Client Both -StatePath $verificationStatePath
+        $verificationState = Get-Content -LiteralPath $verificationStatePath -Raw | ConvertFrom-Json
+        if (@($verificationState.Registrations | Where-Object Status -eq 'verification-failed').Count -ne 2 -or
+            @($verificationState.Registrations | Where-Object InstalledByInstaller).Count -ne 0)
+        {
+            throw 'Successful add commands must not claim ownership of an unverified server command.'
+        }
+    }
+    finally
+    {
+        $env:PATH = $previousPath
+        $env:FAKE_MCP_LOG = $previousFakeLog
+        $env:FAKE_MCP_EXISTING = $previousFakeExisting
+        $env:FAKE_MCP_SERVER = $previousFakeServer
     }
 }
 finally

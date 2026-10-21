@@ -11,7 +11,7 @@ namespace CSharpMcp.Workspace;
 /// </summary>
 internal sealed class SolutionWorkspaceCache : IDisposable
 {
-    private readonly ConcurrentDictionary<string, WorkspaceEntry> entries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Lazy<WorkspaceEntry>> entries = new(StringComparer.OrdinalIgnoreCase);
     private readonly ILogger<SolutionWorkspaceCache> logger;
     private readonly SolutionTrustStore trustStore;
     private bool disposed;
@@ -47,7 +47,18 @@ internal sealed class SolutionWorkspaceCache : IDisposable
         var fullPath = ValidatePath(inputPath);
         var normalizedOptions = loadOptions.Normalize();
         var cacheKey = $"{fullPath}|{normalizedOptions.Configuration}|{normalizedOptions.TargetFramework}";
-        var entry = entries.GetOrAdd(cacheKey, _ => new WorkspaceEntry(fullPath, normalizedOptions, logger));
+        var lazyEntry = entries.GetOrAdd(cacheKey, _ => new Lazy<WorkspaceEntry>(() => new WorkspaceEntry(fullPath, normalizedOptions, logger)));
+        WorkspaceEntry entry;
+        try
+        {
+            entry = lazyEntry.Value;
+        }
+        catch (Exception exception)
+        {
+            entries.TryRemove(new KeyValuePair<string, Lazy<WorkspaceEntry>>(cacheKey, lazyEntry));
+            logger.LogError(exception, "Could not initialize workspace monitoring for {WorkspacePath}; the next request can retry", fullPath);
+            throw;
+        }
 
         return await entry.GetSnapshotAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -74,7 +85,18 @@ internal sealed class SolutionWorkspaceCache : IDisposable
         var fullPath = ValidatePath(inputPath);
         var normalizedOptions = loadOptions.Normalize();
         var cacheKey = $"{fullPath}|{normalizedOptions.Configuration}|{normalizedOptions.TargetFramework}";
-        var entry = entries.GetOrAdd(cacheKey, _ => new WorkspaceEntry(fullPath, normalizedOptions, logger));
+        var lazyEntry = entries.GetOrAdd(cacheKey, _ => new Lazy<WorkspaceEntry>(() => new WorkspaceEntry(fullPath, normalizedOptions, logger)));
+        WorkspaceEntry entry;
+        try
+        {
+            entry = lazyEntry.Value;
+        }
+        catch (Exception exception)
+        {
+            entries.TryRemove(new KeyValuePair<string, Lazy<WorkspaceEntry>>(cacheKey, lazyEntry));
+            logger.LogError(exception, "Could not initialize workspace monitoring for {WorkspacePath}; the next request can retry", fullPath);
+            throw;
+        }
         var reloadedForThisCheck = entry.IsInvalidated;
         var snapshot = await entry.GetSnapshotAsync(cancellationToken).ConfigureAwait(false);
         return entry.GetHealth(snapshot, entries.Count, reloadedForThisCheck);
@@ -91,7 +113,10 @@ internal sealed class SolutionWorkspaceCache : IDisposable
         disposed = true;
         foreach (var entry in entries.Values)
         {
-            entry.Dispose();
+            if (entry.IsValueCreated)
+            {
+                entry.Value.Dispose();
+            }
         }
 
         entries.Clear();
@@ -137,6 +162,7 @@ internal sealed class SolutionWorkspaceCache : IDisposable
         private MSBuildWorkspace? workspace;
         private WorkspaceSnapshot? snapshot;
         private int invalidated = 1;
+        private volatile bool monitoringFailed;
         private long reloadCount;
         private TimeSpan lastLoadDuration;
         private DateTimeOffset? lastInvalidatedAt;
@@ -156,16 +182,26 @@ internal sealed class SolutionWorkspaceCache : IDisposable
             watcher = new FileSystemWatcher(root)
             {
                 IncludeSubdirectories = true,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-                EnableRaisingEvents = true
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                EnableRaisingEvents = false
             };
             watcher.Changed += OnFileChanged;
             watcher.Created += OnFileChanged;
             watcher.Deleted += OnFileChanged;
-            watcher.Renamed += OnFileChanged;
+            watcher.Renamed += OnFileRenamed;
+            watcher.Error += OnWatcherError;
+            try
+            {
+                watcher.EnableRaisingEvents = true;
+            }
+            catch
+            {
+                watcher.Dispose();
+                throw;
+            }
         }
 
-        public bool IsInvalidated => Interlocked.CompareExchange(ref invalidated, 0, 0) != 0;
+        public bool IsInvalidated => monitoringFailed || Interlocked.CompareExchange(ref invalidated, 0, 0) != 0;
 
         public async Task<WorkspaceSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
         {
@@ -174,11 +210,13 @@ internal sealed class SolutionWorkspaceCache : IDisposable
             await loadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                if (snapshot is not null && Interlocked.CompareExchange(ref invalidated, 0, 0) == 0)
+                if (snapshot is not null && !IsInvalidated)
                 {
                     return snapshot;
                 }
 
+                // Clear before loading so changes arriving during evaluation remain pending.
+                Interlocked.Exchange(ref invalidated, 0);
                 workspace?.Dispose();
                 var loadDiagnostics = new List<string>();
                 var properties = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -196,6 +234,8 @@ internal sealed class SolutionWorkspaceCache : IDisposable
                     lock (loadDiagnostics)
                     {
                         loadDiagnostics.Add($"{args.Diagnostic.Kind}: {args.Diagnostic.Message}");
+                        logger.LogWarning("Workspace {WorkspacePath}: {DiagnosticKind}: {DiagnosticMessage}",
+                            inputPath, args.Diagnostic.Kind, args.Diagnostic.Message);
                     }
                 });
 
@@ -214,9 +254,22 @@ internal sealed class SolutionWorkspaceCache : IDisposable
                     loadOptions.TargetFramework);
                 lastLoadDuration = stopwatch.Elapsed;
                 Interlocked.Increment(ref reloadCount);
-                Interlocked.Exchange(ref invalidated, 0);
+                logger.LogInformation("Loaded workspace {WorkspacePath} in {ElapsedMilliseconds} ms with {DiagnosticCount} diagnostics",
+                    inputPath, stopwatch.Elapsed.TotalMilliseconds, loadDiagnostics.Count);
 
                 return snapshot;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                Interlocked.Exchange(ref invalidated, 1);
+                logger.LogInformation("Workspace load cancelled for {WorkspacePath}; the next request can retry", inputPath);
+                throw;
+            }
+            catch (Exception exception)
+            {
+                Interlocked.Exchange(ref invalidated, 1);
+                logger.LogError(exception, "Workspace load failed for {WorkspacePath}; the next request can retry", inputPath);
+                throw;
             }
             finally
             {
@@ -232,7 +285,7 @@ internal sealed class SolutionWorkspaceCache : IDisposable
             return new WorkspaceCacheHealth(
                 inputPath,
                 Path.GetDirectoryName(inputPath)!,
-                Interlocked.CompareExchange(ref invalidated, 0, 0) != 0,
+                IsInvalidated,
                 reloadedForThisCheck,
                 lastInvalidationReason,
                 lastInvalidatedPath,
@@ -256,10 +309,58 @@ internal sealed class SolutionWorkspaceCache : IDisposable
             loadGate.Dispose();
         }
 
+        private void OnWatcherError(object sender, ErrorEventArgs args)
+        {
+            lastInvalidationReason = "WatcherError";
+            lastInvalidatedPath = null;
+            lastInvalidatedAt = DateTimeOffset.UtcNow;
+            Interlocked.Exchange(ref invalidated, 1);
+            logger.LogError(args.GetException(), "Workspace watcher failed for {WorkspacePath}; cache will reload", inputPath);
+            // After overflow the watcher continues; other errors may stop event delivery.
+            // Never reuse a snapshot indefinitely after monitoring has failed.
+            monitoringFailed = true;
+        }
+
+        private void OnFileRenamed(object sender, RenamedEventArgs args)
+        {
+            if (IsRelevantPath(args.OldFullPath, includeUnknown: true))
+            {
+                OnFileChanged(sender, new FileSystemEventArgs(WatcherChangeTypes.Renamed,
+                    Path.GetDirectoryName(args.OldFullPath)!, Path.GetFileName(args.OldFullPath)));
+            }
+
+            OnFileChanged(sender, args);
+        }
+
+        private bool IsRelevantPath(string path, bool includeUnknown = false)
+        {
+            var relativePath = Path.GetRelativePath(Path.GetDirectoryName(inputPath)!, path);
+            var segments = relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            // Restore metadata changes references and must be observed even under obj.
+            var fileName = Path.GetFileName(path);
+            if (fileName.Equals("project.assets.json", StringComparison.OrdinalIgnoreCase) ||
+                fileName.EndsWith(".nuget.g.props", StringComparison.OrdinalIgnoreCase) ||
+                fileName.EndsWith(".nuget.g.targets", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (segments.Any(segment => segment.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                segment.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
+                segment.Equals(".git", StringComparison.OrdinalIgnoreCase) ||
+                segment.Equals(".vs", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            var extension = Path.GetExtension(path);
+            // Directory moves/deletes must invalidate all contained documents too.
+            return includeUnknown || extension.Length == 0 || Directory.Exists(path) || WatchedExtensions.Contains(extension);
+        }
+
         private void OnFileChanged(object sender, FileSystemEventArgs args)
         {
-            if (WatchedExtensions.Contains(Path.GetExtension(args.FullPath)) ||
-                Path.GetFileName(args.FullPath).Equals("global.json", StringComparison.OrdinalIgnoreCase))
+            if (IsRelevantPath(args.FullPath, includeUnknown: args.ChangeType is WatcherChangeTypes.Deleted or WatcherChangeTypes.Renamed))
             {
                 lastInvalidationReason = args.ChangeType.ToString();
                 lastInvalidatedPath = args.FullPath;

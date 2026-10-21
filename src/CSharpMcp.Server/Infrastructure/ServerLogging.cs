@@ -50,16 +50,19 @@ internal static class ServerLogging
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentException.ThrowIfNullOrWhiteSpace(logDirectory);
 
-        Directory.CreateDirectory(logDirectory);
-        var logPath = Path.Combine(logDirectory, LogFileName);
-
         configuration
             .MinimumLevel.Information()
             .Enrich.FromLogContext()
+            .Enrich.WithProperty("ProcessId", Environment.ProcessId)
             .WriteTo.Console(
                 standardErrorFromLevel: LogEventLevel.Verbose,
-                outputTemplate: OutputTemplate)
-            .WriteTo.File(
+                outputTemplate: OutputTemplate);
+
+        try
+        {
+            Directory.CreateDirectory(logDirectory);
+            var logPath = Path.Combine(logDirectory, LogFileName);
+            configuration.WriteTo.File(
                 logPath,
                 rollingInterval: RollingInterval.Day,
                 retainedFileCountLimit: null,
@@ -68,5 +71,11 @@ internal static class ServerLogging
                 shared: true,
                 flushToDiskInterval: TimeSpan.FromSeconds(1),
                 outputTemplate: OutputTemplate);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // A locked or unavailable log directory must not disable MCP discovery.
+            Console.Error.WriteLine($"CSharpMCP file logging unavailable at '{logDirectory}'; continuing with stderr: {exception}");
+        }
     }
 }

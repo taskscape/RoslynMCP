@@ -72,14 +72,16 @@ internal static class SymbolResolver
             if (LooksLikeDocumentationId(query))
             {
                 var documented = DocumentationCommentId.GetFirstSymbolForDeclarationId(query, compilation);
-                if (documented is not null && documented.Locations.Any(location => location.IsInSource))
+                if (documented is not null && documented.Locations.Any(location =>
+                    location.SourceTree is { } tree && compilation.ContainsSyntaxTree(tree)))
                 {
                     candidates.Add(documented);
                 }
             }
 
             var type = compilation.GetTypeByMetadataName(query);
-            if (type is not null && type.Locations.Any(location => location.IsInSource))
+            if (type is not null && type.Locations.Any(location =>
+                location.SourceTree is { } tree && compilation.ContainsSyntaxTree(tree)))
             {
                 candidates.Add(type);
             }
@@ -97,8 +99,10 @@ internal static class SymbolResolver
                     SymbolFilter.TypeAndMember,
                     cancellationToken).ConfigureAwait(false);
 
+                var compilation = await project.GetCompilationAsync(cancellationToken).ConfigureAwait(false);
                 candidates.AddRange(declarations.Where(symbol =>
-                    symbol.Locations.Any(location => location.IsInSource) &&
+                    symbol.Locations.Any(location => location.SourceTree is { } tree &&
+                        compilation?.ContainsSyntaxTree(tree) == true) &&
                     MatchesQuery(symbol, query)));
             }
         }

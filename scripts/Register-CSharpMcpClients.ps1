@@ -33,6 +33,18 @@ if ([string]::IsNullOrWhiteSpace($StatePath))
 }
 
 $resolvedStatePath = [System.IO.Path]::GetFullPath($StatePath)
+if ([System.IO.Path]::GetExtension($resolvedServerPath) -ine '.exe')
+{
+    throw 'ServerPath must identify the installed self-contained .exe, not a DLL, document, or source file.'
+}
+
+$previousState = $null
+if (Test-Path -LiteralPath $resolvedStatePath -PathType Leaf)
+{
+    # Do not destroy ownership evidence if the previous state cannot be read.
+    $previousState = Get-Content -LiteralPath $resolvedStatePath -Raw | ConvertFrom-Json
+}
+$diagnostics = [System.Collections.Generic.List[object]]::new()
 $results = [System.Collections.Generic.List[object]]::new()
 $registrationCmdlet = $PSCmdlet
 
@@ -62,17 +74,62 @@ function Invoke-ExternalCommand
     $ErrorActionPreference = 'Continue'
     try
     {
+        $global:LASTEXITCODE = 0
         $commandOutput = @(& $Command.Source @Arguments 2>&1)
-        $exitCode = $LASTEXITCODE
+        $commandSucceeded = $?
+        $exitCode = if ($commandSucceeded) { $LASTEXITCODE } elseif ($LASTEXITCODE -ne 0) { $LASTEXITCODE } else { 1 }
+    }
+    catch
+    {
+        $commandOutput = @($_.Exception.Message)
+        $exitCode = -1
     }
     finally
     {
         $ErrorActionPreference = $previousErrorActionPreference
     }
+    if ($exitCode -ne 0)
+    {
+        $diagnostics.Add([pscustomobject]@{
+            At = [DateTimeOffset]::Now
+            Command = $Command.Name
+            Operation = $Arguments[0..([Math]::Min(2, $Arguments.Length - 1))] -join ' '
+            ExitCode = $exitCode
+            Output = @($commandOutput | ForEach-Object { $_.ToString() })
+        })
+    }
     return [pscustomobject]@{
         ExitCode = $exitCode
         Output = @($commandOutput | ForEach-Object { $_.ToString() })
     }
+}
+
+function Get-ClientRegistration
+{
+    param([System.Management.Automation.CommandInfo] $Command)
+
+    for ($attempt = 1; $attempt -le 3; $attempt++)
+    {
+        $lookup = Invoke-ExternalCommand -Command $Command -Arguments @('mcp', 'get', 'csharp_roslyn')
+        $absent = ($lookup.Output -join "`n") -match '(?im)^\s*(?:Error:\s*)?(?:No MCP server named [''" ]*csharp_roslyn[''" ]* found\.?|No MCP server found with name:?[ ''"]*csharp_roslyn[''" ]*\.?)\s*$'
+        if ($lookup.ExitCode -eq 0 -or $absent)
+        {
+            return [pscustomobject]@{ Result = $lookup; Absent = $lookup.ExitCode -ne 0 -and $absent }
+        }
+
+        if ($attempt -lt 3) { Start-Sleep -Milliseconds (200 * $attempt) }
+    }
+
+    return [pscustomobject]@{ Result = $lookup; Absent = $false }
+}
+
+function Test-InstalledServerRegistration
+{
+    param([string[]] $Output)
+
+    # Match the command field exactly, not an argument or a similarly prefixed path.
+    $commandPattern = '(?im)^\s*command:\s*"?' + [regex]::Escape($resolvedServerPath) + '"?\s*$'
+    return ($Output -join "`n") -match $commandPattern
 }
 
 function Register-Client
@@ -83,6 +140,9 @@ function Register-Client
         [string] $ClientName
     )
 
+    $previouslyOwned = $null -ne $previousState -and
+        [string]::Equals([string] $previousState.ServerPath, $resolvedServerPath, [StringComparison]::OrdinalIgnoreCase) -and
+        @($previousState.Registrations | Where-Object { $_.Client -eq $ClientName -and $_.InstalledByInstaller }).Count -gt 0
     $commandName = if ($ClientName -eq 'Codex') { 'codex' } else { 'claude' }
     $command = Find-ClientCommand -Name $commandName
     if ($null -eq $command)
@@ -91,20 +151,33 @@ function Register-Client
             Client = $ClientName
             CommandFound = $false
             Status = 'client-not-found'
-            InstalledByInstaller = $false
+            InstalledByInstaller = $previouslyOwned
             Details = "$commandName was not found on PATH; registration was skipped."
         }
     }
 
-    $existing = Invoke-ExternalCommand -Command $command -Arguments @('mcp', 'get', 'csharp_roslyn')
+    $lookup = Get-ClientRegistration -Command $command
+    $existing = $lookup.Result
     if ($existing.ExitCode -eq 0)
     {
         return [pscustomobject]@{
             Client = $ClientName
             CommandFound = $true
             Status = 'already-configured'
-            InstalledByInstaller = $false
+            InstalledByInstaller = $previouslyOwned -and
+                (Test-InstalledServerRegistration -Output $existing.Output)
             Details = 'An existing csharp_roslyn registration was preserved unchanged.'
+        }
+    }
+
+    if (-not $lookup.Absent)
+    {
+        return [pscustomobject]@{
+            Client = $ClientName
+            CommandFound = $true
+            Status = 'discovery-failed'
+            InstalledByInstaller = $previouslyOwned
+            Details = "Could not establish whether csharp_roslyn exists after three attempts; registration was preserved. Exit code $($existing.ExitCode): $($existing.Output -join ' ')"
         }
     }
 
@@ -142,6 +215,19 @@ function Register-Client
     $registration = Invoke-ExternalCommand -Command $command -Arguments $arguments
     if ($registration.ExitCode -eq 0)
     {
+        $verification = Get-ClientRegistration -Command $command
+        if ($verification.Result.ExitCode -ne 0 -or
+            -not (Test-InstalledServerRegistration -Output $verification.Result.Output))
+        {
+            return [pscustomobject]@{
+                Client = $ClientName
+                CommandFound = $true
+                Status = 'verification-failed'
+                InstalledByInstaller = $false
+                Details = 'The add command succeeded but the installed server path could not be verified. Inspect the client configuration before retrying.'
+            }
+        }
+
         return [pscustomobject]@{
             Client = $ClientName
             CommandFound = $true
@@ -257,13 +343,32 @@ $state = [pscustomobject]@{
     ToolGroups = $ToolGroups
     AttemptedAt = [DateTimeOffset]::Now
     Registrations = @($results)
+    Diagnostics = @($diagnostics)
 }
 
 if ($registrationCmdlet.ShouldProcess($resolvedStatePath, 'Write MCP client registration state'))
 {
     $stateDirectory = Split-Path -Parent $resolvedStatePath
     New-Item -ItemType Directory -Force -Path $stateDirectory | Out-Null
-    $state | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resolvedStatePath -Encoding UTF8
+    Add-Content -LiteralPath "$resolvedStatePath.jsonl" -Value ($state | ConvertTo-Json -Depth 6 -Compress) -Encoding UTF8
+    $temporaryStatePath = "$resolvedStatePath.$([guid]::NewGuid().ToString('N')).tmp"
+    try
+    {
+        $state | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $temporaryStatePath -Encoding UTF8
+        # Setup uses Windows PowerShell 5.1 / .NET Framework, which has no overwrite Move overload.
+        if (Test-Path -LiteralPath $resolvedStatePath -PathType Leaf)
+        {
+            [System.IO.File]::Replace($temporaryStatePath, $resolvedStatePath, [NullString]::Value)
+        }
+        else
+        {
+            [System.IO.File]::Move($temporaryStatePath, $resolvedStatePath)
+        }
+    }
+    finally
+    {
+        if (Test-Path -LiteralPath $temporaryStatePath) { Remove-Item -LiteralPath $temporaryStatePath -Force }
+    }
 }
 
 foreach ($result in $results)

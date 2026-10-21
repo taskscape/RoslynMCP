@@ -13,6 +13,49 @@ namespace CSharpMcp.Tests;
 /// </summary>
 public sealed class McpProtocolIntegrationTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LoggingFailureDoesNotPreventDiscoveryOrSubsequentRequests(bool relativeDirectory)
+    {
+        var testRoot = Path.Combine(Path.GetTempPath(), "CSharpMCP.LoggingTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(testRoot);
+        var blockedDirectory = Path.Combine(testRoot, "blocked");
+        File.WriteAllText(blockedDirectory, "This file prevents log directory creation.");
+        var standardError = new ConcurrentQueue<string>();
+        var transport = new StdioClientTransport(new StdioClientTransportOptions
+        {
+            Name = "logging-fallback-test",
+            Command = "dotnet",
+            Arguments = [typeof(McpToolResponse).Assembly.Location],
+            EnvironmentVariables = new Dictionary<string, string?>
+            {
+                ["CSHARPMCP_LOG_DIRECTORY"] = relativeDirectory ? "relative-logs" : blockedDirectory,
+                ["CSHARPMCP_TOOL_GROUPS"] = ""
+            },
+            StandardErrorLines = line => standardError.Enqueue(line),
+            ShutdownTimeout = TimeSpan.FromSeconds(10)
+        });
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        await using (var client = await McpClient.CreateAsync(transport, cancellationToken: timeout.Token))
+        {
+            Assert.Equal(32, (await client.ListToolsAsync(cancellationToken: timeout.Token)).Count);
+            var error = await client.CallToolAsync("solution_overview", new Dictionary<string, object?>
+            {
+                ["workspacePath"] = Path.Combine(testRoot, "missing.slnx")
+            }, cancellationToken: timeout.Token);
+            Assert.True(error.IsError);
+            Assert.Equal(32, (await client.ListToolsAsync(cancellationToken: timeout.Token)).Count);
+        }
+
+        Assert.Contains(standardError, line => line.Contains(relativeDirectory
+            ? "Invalid CSharpMCP log directory" : "file logging unavailable", StringComparison.Ordinal));
+        Assert.Contains(standardError, line => line.Contains("solution_overview", StringComparison.Ordinal) &&
+            (line.Contains("failed", StringComparison.Ordinal) || line.Contains("error", StringComparison.Ordinal)));
+        Directory.Delete(testRoot, recursive: true);
+    }
+
     /// <summary>
     /// Proves that the optional profile advertises and executes both feature-gated tools.
     /// </summary>

@@ -690,6 +690,88 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkspaceCacheIgnoresGeneratedSourcesAndReloadsAfterSourceChanges()
+    {
+        var first = await workspaceCache.GetSnapshotAsync(GetProjectPath(), CancellationToken.None);
+        var generatedDirectory = Path.Combine(testRoot, "obj", "cache-test");
+        Directory.CreateDirectory(generatedDirectory);
+        File.WriteAllText(Path.Combine(generatedDirectory, "Generated.cs"), "class Generated { }");
+        await Task.Delay(250);
+        var unchanged = await workspaceCache.GetSnapshotAsync(GetProjectPath(), CancellationToken.None);
+        Assert.Same(first, unchanged);
+
+        var newSource = Path.Combine(testRoot, "AddedAfterLoad.cs");
+        File.WriteAllText(newSource, "namespace Fixture; public class AddedAfterLoad { }");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        WorkspaceSnapshot updated;
+        do
+        {
+            await Task.Delay(50, timeout.Token);
+            updated = await workspaceCache.GetSnapshotAsync(GetProjectPath(), timeout.Token);
+        }
+        while (ReferenceEquals(first, updated));
+
+        Assert.Contains(updated.Solution.Projects.SelectMany(project => project.Documents),
+            document => document.FilePath == newSource);
+    }
+
+    [Fact]
+    public async Task WorkspaceCacheRetriesAfterAnInvalidSolutionIsRepaired()
+    {
+        var brokenSolution = Path.Combine(testRoot, "Repair.slnx");
+        File.WriteAllText(brokenSolution, "<Solution>");
+        await Assert.ThrowsAnyAsync<Exception>(() => workspaceCache.GetSnapshotAsync(brokenSolution, CancellationToken.None));
+
+        File.WriteAllText(brokenSolution, "<Solution><Project Path=\"Fixture.csproj\" /></Solution>");
+        var repaired = await workspaceCache.GetSnapshotAsync(brokenSolution, CancellationToken.None);
+        Assert.Single(repaired.Solution.Projects);
+    }
+
+    [Fact]
+    public async Task WorkspaceCacheTracksDirectoryRenamesAndDeletes()
+    {
+        var originalDirectory = Path.Combine(testRoot, "Feature.Source");
+        var renamedDirectory = Path.Combine(testRoot, "Renamed.Source");
+        Directory.CreateDirectory(originalDirectory);
+        File.WriteAllText(Path.Combine(originalDirectory, "Feature.cs"), "class MovedFeature { }");
+        var previous = await workspaceCache.GetSnapshotAsync(GetProjectPath(), CancellationToken.None);
+        Directory.Move(originalDirectory, renamedDirectory);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        WorkspaceSnapshot renamed;
+        do
+        {
+            await Task.Delay(50, timeout.Token);
+            renamed = await workspaceCache.GetSnapshotAsync(GetProjectPath(), timeout.Token);
+        }
+        while (ReferenceEquals(previous, renamed));
+
+        Assert.Contains(renamed.Solution.Projects.SelectMany(project => project.Documents),
+            document => document.FilePath == Path.Combine(renamedDirectory, "Feature.cs"));
+        Directory.Delete(renamedDirectory, recursive: true);
+        WorkspaceSnapshot deleted;
+        do
+        {
+            await Task.Delay(50, timeout.Token);
+            deleted = await workspaceCache.GetSnapshotAsync(GetProjectPath(), timeout.Token);
+        }
+        while (ReferenceEquals(renamed, deleted));
+
+        Assert.DoesNotContain(deleted.Solution.Projects.SelectMany(project => project.Documents),
+            document => document.Name == "Feature.cs");
+    }
+
+    [Theory]
+    [InlineData("T:Fixture.CandidateMethods")]
+    [InlineData("Fixture.CandidateMethods")]
+    [InlineData("CandidateMethods")]
+    public async Task SymbolResolutionDoesNotDuplicateSymbolsFromProjectReferences(string query)
+    {
+        var snapshot = await workspaceCache.GetSnapshotAsync(GetSolutionPath(), CancellationToken.None);
+        var symbol = await SymbolResolver.ResolveSingleAsync(snapshot.Solution, query, null, CancellationToken.None);
+        Assert.Equal("T:Fixture.CandidateMethods", SymbolResolver.GetStableId(symbol));
+    }
+
+    [Fact]
     [ToolCoverage("symbol_source", "event_flow", "attribute_usage")]
     public async Task SourceEventAndAttributeToolsReturnResolvedEvidence()
     {
@@ -985,6 +1067,46 @@ public sealed class RoslynAnalysisServiceTests : IDisposable
         Assert.True(revocation.SessionTrustRemoved);
         Assert.True(revocation.PersistentTrustRemoved);
         Assert.False(store.IsTrusted(GetProjectPath()));
+    }
+
+    [Fact]
+    public void FailedTrustPersistenceCanBeRetriedWithoutClaimingSuccess()
+    {
+        var blockedDirectory = Path.Combine(testRoot, "blocked-trust");
+        File.WriteAllText(blockedDirectory, "blocks directory creation");
+        var store = new SolutionTrustStore(Path.Combine(blockedDirectory, "trust.json"), NullLogger<SolutionTrustStore>.Instance);
+        Assert.ThrowsAny<IOException>(() => store.Trust(testRoot, persist: true));
+        Assert.False(Assert.Single(store.List()).Persisted);
+        Assert.ThrowsAny<IOException>(() => store.Trust(testRoot, persist: true));
+        File.Delete(blockedDirectory);
+        Assert.True(store.Trust(testRoot, persist: true).Persisted);
+    }
+
+    [Fact]
+    public void MalformedTrustRootsDoNotDisableSessionTrustOrGrantPartialPersistentTrust()
+    {
+        var trustPath = Path.Combine(testRoot, "invalid-trust.json");
+        File.WriteAllText(trustPath, JsonSerializer.Serialize(new { roots = new[] { testRoot, "\0" } }));
+        var store = new SolutionTrustStore(trustPath, NullLogger<SolutionTrustStore>.Instance);
+        Assert.Empty(store.List());
+        Assert.True(store.Trust(testRoot, persist: false).SessionTrusted);
+    }
+
+    [Fact]
+    public void FailedTrustRevocationCanBeRetried()
+    {
+        var trustPath = Path.Combine(testRoot, "revocation-trust.json");
+        var store = new SolutionTrustStore(trustPath, NullLogger<SolutionTrustStore>.Instance);
+        store.Trust(testRoot, persist: true);
+        File.Delete(trustPath);
+        Directory.CreateDirectory(trustPath);
+        var failure = Assert.ThrowsAny<Exception>(() => store.Revoke(testRoot));
+        Assert.True(failure is IOException or UnauthorizedAccessException);
+        Assert.True(Assert.Single(store.List()).Persisted);
+        Directory.Delete(trustPath);
+        Assert.True(store.Revoke(testRoot).PersistentTrustRemoved);
+        Assert.Empty(store.List());
+        Assert.Empty(new SolutionTrustStore(trustPath, NullLogger<SolutionTrustStore>.Instance).List());
     }
 
     [Fact]
